@@ -1,7 +1,8 @@
-streamlit 
-tensorflow 
-numpy 
-pandas 
-pillow 
-folium 
+streamlit>=1.42.0
+tensorflow
+numpy
+pandas
+pillow
+folium
 google-genai
+Authlib>=1.3.2

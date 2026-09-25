@@ -3,6 +3,9 @@ import io
 import json
 import html
 import base64
+import hashlib
+import hmac
+import re
 import datetime as dt
 import urllib.parse
 from pathlib import Path
@@ -412,6 +415,11 @@ def init_state():
         "assistant": None,
         "assistant_messages": [],
         "last_report_food": None,
+        "authenticated": False,
+        "auth_user": "",
+        "auth_method": "",
+        "auth_profile": {},
+        "login_attempted": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -445,7 +453,242 @@ def load_class_names():
 
 
 MODEL = load_model()
+
 CLASS_NAMES = load_class_names()
+
+
+# ============================================================
+# ============================================================
+# LOCAL USER AUTHENTICATION
+#
+# No Gmail / Google account is required.
+# Users can create their own username + password and get a profile.
+# Passwords are stored as salted PBKDF2 hashes in dhanya_users.json.
+# This is a lightweight hackathon auth store; for production use,
+# move the user store to a real database/backend.
+# ============================================================
+USERS_PATH = APP_DIR / "dhanya_users.json"
+
+
+def _load_users():
+    try:
+        if not USERS_PATH.exists():
+            return {}
+        raw = json.loads(USERS_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_users(users):
+    tmp = USERS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(users, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(USERS_PATH)
+
+
+def _hash_password(password, salt_hex=None):
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return salt.hex(), digest.hex()
+
+
+def _verify_password(password, salt_hex, stored_hash):
+    try:
+        _, digest = _hash_password(password, salt_hex)
+        return hmac.compare_digest(digest, str(stored_hash))
+    except Exception:
+        return False
+
+
+def _safe_username(username):
+    return bool(re.fullmatch(r"[A-Za-z0-9_]{3,24}", username.strip()))
+
+
+def _set_authenticated(username, profile, method="password"):
+    st.session_state.authenticated = True
+    st.session_state.auth_method = method
+    st.session_state.auth_user = username
+    st.session_state.auth_profile = profile
+    st.session_state.login_attempted = True
+
+
+def _render_profile_card(profile):
+    display_name = html.escape(str(profile.get("display_name") or profile.get("username") or "User"))
+    username = html.escape(str(profile.get("username") or ""))
+    created = html.escape(str(profile.get("created_at") or ""))
+    st.markdown(
+        f"""
+        <div style="background:rgba(255,252,243,.96);border:1px solid rgba(91,43,38,.13);"
+             "border-radius:22px;padding:26px;box-shadow:0 14px 38px rgba(72,52,28,.10);">
+          <div style="display:flex;align-items:center;gap:18px;">
+            <div style="width:72px;height:72px;border-radius:50%;display:flex;align-items:center;"
+                 "justify-content:center;background:#f5df9a;font-size:34px;border:1px solid #b9853a;">👤</div>
+            <div>
+              <div style="font-family:Georgia,serif;font-size:1.7rem;font-weight:800;color:#5b2b24;">{display_name}</div>
+              <div style="color:#776b61;margin-top:4px;">@{username}</div>
+            </div>
+          </div>
+          <div style="margin-top:22px;display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+            <div style="padding:13px 15px;border-radius:14px;background:#fbf3df;border:1px solid #eadcc6;">
+              <div style="font-size:.78rem;color:#8b7767;text-transform:uppercase;letter-spacing:.06em;">Profile</div>
+              <div style="font-weight:700;color:#4b392f;margin-top:4px;">Dhanya AI User</div>
+            </div>
+            <div style="padding:13px 15px;border-radius:14px;background:#fbf3df;border:1px solid #eadcc6;">
+              <div style="font-size:.78rem;color:#8b7767;text-transform:uppercase;letter-spacing:.06em;">Member since</div>
+              <div style="font-weight:700;color:#4b392f;margin-top:4px;">{created or "Today"}</div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_login_page():
+    st.markdown(
+        """
+        <div class="login-shell">
+          <div class="login-card">
+            <div class="login-mark">🌾</div>
+            <div class="login-title">Dhanya AI</div>
+            <div class="login-subtitle">
+              Sign in or create your own Dhanya AI profile to access food identification,
+              nutrition intelligence, cultivation insights and the AI assistant.
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Keep the form compact and centered instead of stretching across the page.
+    _, form_col, _ = st.columns([1, 1.25, 1])
+
+    with form_col:
+        sign_in_tab, sign_up_tab = st.tabs(["🔑 Sign In", "✨ Create Account"])
+
+        with sign_in_tab:
+            username = st.text_input(
+                "Username",
+                key="login_username",
+                placeholder="Enter your username",
+            )
+            password = st.text_input(
+                "Password",
+                type="password",
+                key="login_password",
+                placeholder="Enter your password",
+            )
+
+            if st.button("🔓 Sign in", use_container_width=True, type="primary"):
+                username_clean = username.strip()
+                users = _load_users()
+                profile = users.get(username_clean)
+                if not profile or not _verify_password(
+                    password,
+                    profile.get("salt", ""),
+                    profile.get("password_hash", ""),
+                ):
+                    st.error("Invalid username or password.")
+                    st.session_state.login_attempted = True
+                else:
+                    _set_authenticated(username_clean, profile, "password")
+                    st.success(
+                        f"Welcome back, {profile.get('display_name') or username_clean}!"
+                    )
+                    st.rerun()
+
+            st.caption(
+                "Sign in with your Dhanya AI username and password."
+            )
+
+        with sign_up_tab:
+            display_name = st.text_input(
+                "Your name",
+                key="signup_name",
+                placeholder="Example: Preethi",
+            )
+            new_username = st.text_input(
+                "Choose a username",
+                key="signup_username",
+                placeholder="3–24 letters, numbers or _",
+            )
+            new_password = st.text_input(
+                "Create password",
+                type="password",
+                key="signup_password",
+                placeholder="At least 6 characters",
+            )
+            confirm_password = st.text_input(
+                "Confirm password",
+                type="password",
+                key="signup_confirm",
+                placeholder="Re-enter password",
+            )
+
+            if st.button(
+                "🌱 Create my profile",
+                use_container_width=True,
+                type="primary",
+            ):
+                name_clean = display_name.strip()
+                username_clean = new_username.strip()
+                users = _load_users()
+
+                if len(name_clean) < 2:
+                    st.error("Please enter your name.")
+                elif not _safe_username(username_clean):
+                    st.error(
+                        "Username must be 3–24 characters using only letters, numbers or underscore."
+                    )
+                elif username_clean in users:
+                    st.error(
+                        "That username already exists. Please choose another one."
+                    )
+                elif len(new_password) < 6:
+                    st.error("Password must be at least 6 characters.")
+                elif new_password != confirm_password:
+                    st.error("Passwords do not match.")
+                else:
+                    salt_hex, password_hash = _hash_password(new_password)
+                    created_at = dt.datetime.now().strftime("%d %b %Y")
+                    profile = {
+                        "username": username_clean,
+                        "display_name": name_clean,
+                        "salt": salt_hex,
+                        "password_hash": password_hash,
+                        "created_at": created_at,
+                    }
+                    users[username_clean] = profile
+                    _save_users(users)
+                    _set_authenticated(username_clean, profile, "password")
+                    st.session_state.page = "Profile"
+                    st.success("Profile created successfully!")
+                    st.rerun()
+
+            st.caption(
+                "No Gmail account is needed. Each user can create a Dhanya AI username/password profile."
+            )
+
+def require_login():
+    if not st.session_state.authenticated:
+        render_login_page()
+        st.stop()
+
+
+def render_logout_button():
+    with st.sidebar:
+        st.markdown("---")
+        profile = st.session_state.get("auth_profile") or {}
+        display_name = profile.get("display_name") or st.session_state.get("auth_user") or "User"
+        st.caption(f"Signed in as **{display_name}**")
+        if st.button("Log out", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.auth_user = ""
+            st.session_state.auth_method = ""
+            st.session_state.auth_profile = {}
+            st.session_state.page = "Dashboard"
+            st.rerun()
 
 
 def predict_image(pil_image):
@@ -1427,6 +1670,63 @@ def inject_css():
             color-scheme:light !important;
         }
 
+
+        /* =====================================================
+           Dhanya AI Login Screen
+           ===================================================== */
+        .login-shell {
+            min-height: 76vh;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            padding:40px 12px;
+        }
+
+        .login-card {
+            width:min(460px, 100%);
+            background:rgba(255,252,243,.97);
+            border:1px solid rgba(91,43,38,.13);
+            border-radius:26px;
+            padding:30px 30px 24px;
+            box-shadow:0 18px 48px rgba(72,52,28,.13);
+            text-align:center;
+        }
+
+        .login-mark {
+            width:76px;
+            height:76px;
+            margin:0 auto 12px;
+            border-radius:50%;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            font-size:40px;
+            background:
+                radial-gradient(circle, #fff8df 0 34%, #ecd28f 35% 58%, #a86f2c 59% 62%, #fff8df 63%);
+            border:1px solid rgba(124,84,33,.25);
+            box-shadow:0 8px 22px rgba(90,55,26,.14);
+        }
+
+        .login-title {
+            font-family:Georgia, "Times New Roman", serif;
+            font-size:2rem;
+            font-weight:800;
+            color:var(--dhanya-deep);
+            margin-bottom:5px;
+        }
+
+        .login-subtitle {
+            color:#776b61;
+            font-size:.92rem;
+            line-height:1.5;
+            margin-bottom:18px;
+        }
+
+        @media (max-width: 600px) {
+            .login-card { padding:24px 20px 20px; }
+            .login-title { font-size:1.7rem; }
+        }
+
         @media print {
             @page { size: A4; margin: 14mm; }
 
@@ -1473,6 +1773,7 @@ def inject_css():
     )
 
 inject_css()
+require_login()
 
 
 # ============================================================
@@ -1543,6 +1844,7 @@ def render_sidebar():
             ("📅", t("daily_intake"), "Daily Intake"),
             ("⚖️", t("compare"), "Compare"),
             ("📜", t("history"), "History"),
+            ("👤", "Profile", "Profile"),
             ("ℹ️", t("about"), "About"),
         ]
 
@@ -3077,6 +3379,30 @@ def page_history():
         set_page("Identify Food")
 
 
+def page_profile():
+    profile = st.session_state.get("auth_profile") or {}
+    render_page_header("My Profile", "Your Dhanya AI account profile")
+    if not profile:
+        st.info("Create or sign in to a profile to view account details.")
+        return
+
+    _render_profile_card(profile)
+
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Username", f"@{profile.get('username', '')}")
+    with c2:
+        st.metric("Account type", "Dhanya AI User")
+
+    st.markdown(
+        "<div style='margin-top:18px;padding:14px 16px;border-radius:14px;"
+        "background:rgba(255,250,239,.76);border:1px solid rgba(91,43,38,.10);"
+        "color:#6c5b4e;'>Your profile is created with a Dhanya AI username and password. No Gmail account is required.</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def page_about():
     render_page_header(
         t("about"),
@@ -3133,6 +3459,7 @@ def page_about():
 # APP ROUTER
 # ============================================================
 render_sidebar()
+render_logout_button()
 
 page = st.session_state.page
 
@@ -3158,6 +3485,8 @@ elif page == "Compare":
     page_compare()
 elif page == "History":
     page_history()
+elif page == "Profile":
+    page_profile()
 elif page == "About":
     page_about()
 else:
